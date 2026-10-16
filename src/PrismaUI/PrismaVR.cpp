@@ -8,6 +8,7 @@
 #include "PrismaVR.h"
 #include "PrismaVR_Bridge.h"
 #include "ModelPreview.h"
+#include "VRInputFilters.h"
 
 #include <Windows.h>
 #include <commctrl.h>
@@ -16,6 +17,8 @@
 #include <map>
 #include <string>
 #include <chrono>
+#include <cstdlib>
+#include <mutex>
 
 #pragma comment(lib, "comctl32.lib")
 
@@ -208,10 +211,12 @@ struct VROverlayState {
 	bool worldLocked = false;
 	bool modderPositioned = false;
 
-	// Grab state (ray-based: panel follows laser aim direction at fixed distance)
+	// Grab state. The offset keeps the exact point under the laser attached to
+	// the controller ray instead of snapping the panel center to it.
 	bool isGrabbed = false;
 	int grabbedByController = -1; // 0=left, 1=right
 	float grabDistance = 1.0f;    // Distance along laser ray at grab start
+	float grabOffX = 0.0f, grabOffY = 0.0f, grabOffZ = 0.0f;
 
 	// Resize state (both triggers held)
 	bool isResizing = false;
@@ -257,12 +262,26 @@ struct ControllerInfo {
 	// Trigger timing for tap vs hold detection
 	bool triggerWasPressed = false;
 	std::chrono::steady_clock::time_point triggerPressTime;
+	uint64_t pressedViewId = 0;
+	int pressedPixelX = 0;
+	int pressedPixelY = 0;
+	bool mouseDownActive = false;
+	bool scrollCaptureActive = false;
+	std::chrono::steady_clock::time_point lastScrollTime{};
+	bool scrollClockInitialized = false;
+	float scrollRemainderX = 0.0f;
+	float scrollRemainderY = 0.0f;
+	std::chrono::steady_clock::time_point lastPoseTime;
+	bool poseClockInitialized = false;
+	PrismaUI::VRInput::AdaptivePoseFilter poseFilter;
 };
 
 static ControllerInfo g_controllers[2]; // 0=left, 1=right
 
-// Trigger hold threshold (seconds)
-static constexpr float TRIGGER_HOLD_THRESHOLD = 0.3f;
+// A short hold on ordinary panel chrome moves the panel. A deliberate half-second
+// hold inside scrollable content captures that exact pane instead.
+static constexpr float PANEL_GRAB_HOLD_THRESHOLD = 0.3f;
+static constexpr float SCROLL_CAPTURE_HOLD_THRESHOLD = 0.5f;
 
 // World-locked panels auto-destruct beyond this distance from the player (meters)
 static constexpr float AUTO_CLOSE_DISTANCE = 50.0f;
@@ -318,10 +337,67 @@ static constexpr float MAX_GRAB_DISTANCE     = 5.0f;  // meters — can't push p
 static constexpr float MIN_RESIZE_DISTANCE   = 0.01f; // meters — prevents division by zero
 
 // Input thresholds
-static constexpr float THUMBSTICK_DEADZONE     = 0.1f;   // ignore stick deflection below this
+static constexpr float MANIPULATION_THUMBSTICK_DEADZONE = 0.1f;
 static constexpr float RESIZE_PUSH_PULL_SPEED  = 0.03f;  // meters/frame at full stick deflection
 static constexpr float DEPTH_ADJUST_SPEED      = 0.02f;  // meters/frame for free-hand depth control
-static constexpr float SCROLL_DELTA_MULTIPLIER = 40.0f;  // scroll pixels per full stick deflection
+
+// VR input configuration. Values are loaded once from Data/SKSE/Plugins/PrismaUI_VR.ini.
+static constexpr const char* VR_INPUT_INI_PATH = ".\\Data\\SKSE\\Plugins\\PrismaUI_VR.ini";
+
+struct VRInputConfig {
+	PrismaUI::VRInput::PoseFilterConfig poseFilter;
+	float thumbstickDeadzone = 0.18f;
+	float scrollPixelsPerSecond = 1000.0f;
+};
+
+static VRInputConfig g_vrInputConfig;
+
+static float ReadIniFloat(const char* section, const char* key, float defaultValue)
+{
+	char defaultText[32]{};
+	_snprintf_s(defaultText, sizeof(defaultText), _TRUNCATE, "%.6g", defaultValue);
+	char valueText[64]{};
+	GetPrivateProfileStringA(section, key, defaultText, valueText,
+	                         static_cast<DWORD>(sizeof(valueText)), VR_INPUT_INI_PATH);
+	char* end = nullptr;
+	const float value = std::strtof(valueText, &end);
+	return end != valueText && std::isfinite(value) ? value : defaultValue;
+}
+
+static void LoadVRInputConfig()
+{
+	auto& filter = g_vrInputConfig.poseFilter;
+	filter.enabled = GetPrivateProfileIntA("Laser", "bSmoothing", 1, VR_INPUT_INI_PATH) != 0;
+	filter.directionMinCutoffHz = PrismaUI::VRInput::Clamp(
+		ReadIniFloat("Laser", "fDirectionMinCutoffHz", 4.0f), 0.5f, 30.0f);
+	filter.directionBeta = PrismaUI::VRInput::Clamp(
+		ReadIniFloat("Laser", "fDirectionBeta", 0.35f), 0.0f, 20.0f);
+	filter.positionMinCutoffHz = PrismaUI::VRInput::Clamp(
+		ReadIniFloat("Laser", "fPositionMinCutoffHz", 6.0f), 0.5f, 30.0f);
+	filter.positionBeta = PrismaUI::VRInput::Clamp(
+		ReadIniFloat("Laser", "fPositionBeta", 12.0f), 0.0f, 30.0f);
+	filter.derivativeCutoffHz = PrismaUI::VRInput::Clamp(
+		ReadIniFloat("Laser", "fDerivativeCutoffHz", 1.0f), 0.1f, 10.0f);
+	filter.snapAngleDegrees = PrismaUI::VRInput::Clamp(
+		ReadIniFloat("Laser", "fSnapAngleDegrees", 60.0f), 1.0f, 90.0f);
+	filter.snapDistanceMeters = PrismaUI::VRInput::Clamp(
+		ReadIniFloat("Laser", "fSnapDistanceMeters", 0.35f), 0.02f, 1.0f);
+	filter.maxGapSeconds = PrismaUI::VRInput::Clamp(
+		ReadIniFloat("Laser", "fMaxGapSeconds", 0.25f), 0.05f, 1.0f);
+	g_vrInputConfig.thumbstickDeadzone = PrismaUI::VRInput::Clamp(
+		ReadIniFloat("Scrolling", "fThumbstickDeadzone", 0.18f), 0.05f, 0.80f);
+	g_vrInputConfig.scrollPixelsPerSecond = PrismaUI::VRInput::Clamp(
+		ReadIniFloat("Scrolling", "fPixelsPerSecond", 1000.0f), 100.0f, 4000.0f);
+
+	logger::info(
+		"PrismaVR: input config loaded: smoothing={}, dirCutoff={:.2f}Hz beta={:.2f}, "
+		"posCutoff={:.2f}Hz beta={:.2f}, snap={:.0f}deg/{:.2f}m, gap={:.2f}s, "
+		"scrollDeadzone={:.2f}, scrollSpeed={:.0f}px/s",
+		filter.enabled, filter.directionMinCutoffHz, filter.directionBeta,
+		filter.positionMinCutoffHz, filter.positionBeta,
+		filter.snapAngleDegrees, filter.snapDistanceMeters, filter.maxGapSeconds,
+		g_vrInputConfig.thumbstickDeadzone, g_vrInputConfig.scrollPixelsPerSecond);
+}
 
 // CSS cursor dot styling
 static constexpr int CURSOR_DOT_SIZE_PX = 12;          // pixel diameter of laser dot on panel
@@ -346,9 +422,15 @@ static bool g_combatMasked = false;
 static HWND g_gameHwnd = nullptr;
 static constexpr UINT_PTR PRISMAVR_SUBCLASS_ID = 0x5052564B; // "PRVK"
 static constexpr UINT WM_OC_CHAR = WM_APP + 0x4F45;
-static uint64_t g_keyboardTargetViewId = 0; // view that last received a laser click
+static std::atomic<uint64_t> g_keyboardTargetViewId{0}; // view that last received a laser click
+static std::atomic<uint64_t> g_keyboardFocusGeneration{0};
+static std::mutex g_keyboardFocusStateMutex;
 static std::atomic<bool> g_textInputFocused{false}; // true ONLY when an <input>/<textarea>/contenteditable has focus
-static std::atomic<bool> g_interactiveDragActive{false}; // true when trigger-holding on a slider/range/scrollbar — suppresses panel grab
+static std::atomic<bool> g_interactiveDragActive[2]{{false}, {false}}; // per-hand slider/draggable state; scroll panes remain grabbable
+static std::atomic<bool> g_scrollTargetCaptured[2]{{false}, {false}}; // exact pane captured at trigger-down
+static std::atomic<uint64_t> g_scrollTargetViewId[2]{{0}, {0}};
+static std::atomic<bool> g_pointerProbePending[2]{{false}, {false}};
+static std::atomic<uint64_t> g_pointerInteractionGeneration[2]{{0}, {0}};
 
 // Active hand for mouse interaction: -1 = none (first click activates), 0 = left, 1 = right.
 // Only the active hand sends mouse move/click events to Ultralight.
@@ -363,6 +445,83 @@ struct OCAimPoseData {
 	bool valid[2];
 };
 static const OCAimPoseData* g_aimPoses = nullptr; // pointer from OC via window property
+
+static void ClearCapturedScrollTarget(std::shared_ptr<PrismaUI::Core::PrismaView> view, int hand)
+{
+	if (hand < 0 || hand > 1)
+		return;
+	g_scrollTargetCaptured[hand].store(false);
+	g_scrollTargetViewId[hand].store(0);
+	if (!view)
+		return;
+	PrismaVR_Bridge::RunJavaScript(view,
+		"var a=window.__prismaVrScrollTargets;if(a)a[" + std::to_string(hand) + "]=null;");
+}
+
+static void QueueCancelledMouseRelease(std::shared_ptr<PrismaUI::Core::PrismaView> view,
+	const ControllerInfo& controller)
+{
+	if (!view || !controller.mouseDownActive)
+		return;
+	ultralight::MouseEvent cancelMove;
+	cancelMove.type = ultralight::MouseEvent::kType_MouseMoved;
+	cancelMove.x = -1;
+	cancelMove.y = -1;
+	cancelMove.button = ultralight::MouseEvent::kButton_None;
+	PrismaVR_Bridge::FireMouseEvent(view, cancelMove);
+
+	ultralight::MouseEvent cancelUp;
+	cancelUp.type = ultralight::MouseEvent::kType_MouseUp;
+	cancelUp.x = -1;
+	cancelUp.y = -1;
+	cancelUp.button = ultralight::MouseEvent::kButton_Left;
+	PrismaVR_Bridge::FireMouseEvent(view, cancelUp);
+}
+
+static void ResetPointerState(int hand)
+{
+	if (hand < 0 || hand > 1)
+		return;
+	g_pointerInteractionGeneration[hand].fetch_add(1);
+	g_pointerProbePending[hand].store(false);
+	g_interactiveDragActive[hand].store(false);
+	g_scrollTargetCaptured[hand].store(false);
+	g_scrollTargetViewId[hand].store(0);
+	auto& controller = g_controllers[hand];
+	controller.mouseDownActive = false;
+	controller.pressedViewId = 0;
+	controller.scrollCaptureActive = false;
+	controller.scrollClockInitialized = false;
+	controller.scrollRemainderX = 0.0f;
+	controller.scrollRemainderY = 0.0f;
+	if (g_mouseActiveHand == hand)
+		g_mouseActiveHand = -1;
+}
+
+static void CancelPointerStateForView(uint64_t viewId,
+	std::shared_ptr<PrismaUI::Core::PrismaView> view)
+{
+	auto overlayIt = g_vrOverlays.find(viewId);
+	for (int hand = 0; hand < 2; ++hand) {
+		auto& controller = g_controllers[hand];
+		const bool pressedOnView = controller.pressedViewId == viewId;
+		const bool grabbedView = overlayIt != g_vrOverlays.end() && overlayIt->second.isGrabbed &&
+		                         overlayIt->second.grabbedByController == hand;
+		if (!pressedOnView && !grabbedView)
+			continue;
+
+		if (pressedOnView)
+			QueueCancelledMouseRelease(view, controller);
+		ResetPointerState(hand);
+		ClearCapturedScrollTarget(view, hand);
+
+		if (grabbedView) {
+			overlayIt->second.isGrabbed = false;
+			overlayIt->second.isResizing = false;
+			overlayIt->second.grabbedByController = -1;
+		}
+	}
+}
 
 // ============================================================================
 // Section 5: VR Runtime Detection & Interface Loading
@@ -718,6 +877,21 @@ static void DestroyVROverlay(uint64_t viewId)
 	auto it = g_vrOverlays.find(viewId);
 	if (it == g_vrOverlays.end()) return;
 
+	// A hidden/destroyed last view bypasses ProcessInput for this frame. Cancel
+	// any DOM press and invalidate delayed scroll capture while the view object
+	// is still reachable, before removing its overlay state.
+	CancelPointerStateForView(viewId, PrismaVR_Bridge::FindView(viewId));
+	{
+		std::lock_guard lock(g_keyboardFocusStateMutex);
+		if (g_keyboardTargetViewId.load() == viewId) {
+			g_keyboardTargetViewId.store(0);
+			g_keyboardFocusGeneration.fetch_add(1);
+			g_textInputFocused.store(false);
+			if (g_gameHwnd)
+				RemovePropW(g_gameHwnd, L"OC_PRISMA_TEXT");
+		}
+	}
+
 	if (it->second.handle) {
 		VCallOvl(g_overlay, OVL_SLOT::HideOverlay, "HideOverlay", it->second.handle);
 		VCallOvl(g_overlay, OVL_SLOT::DestroyOverlay, "DestroyOverlay", it->second.handle);
@@ -874,34 +1048,63 @@ static void UpdateControllers()
 	for (int hand = 0; hand < 2; hand++) {
 		openvr::TrackedDeviceIndex_t idx = (hand == 0) ? leftIdx : rightIdx;
 		auto& ctrl = g_controllers[hand];
+		auto invalidateTracking = [&ctrl]() {
+			ctrl.valid = false;
+			ctrl.triggerPressed = false;
+			ctrl.gripPressed = false;
+			ctrl.triggerValue = 0.0f;
+			ctrl.thumbstickX = 0.0f;
+			ctrl.thumbstickY = 0.0f;
+			ctrl.poseClockInitialized = false;
+			ctrl.poseFilter.Reset();
+		};
 
 		// Save previous state for edge detection (must happen BEFORE updating)
 		ctrl.triggerWasPressed = ctrl.triggerPressed;
 		ctrl.gripWasPressed = ctrl.gripPressed;
 
 		if (idx == openvr::k_unTrackedDeviceIndexInvalid || !poses[idx].bPoseIsValid) {
-			ctrl.valid = false;
+			invalidateTracking();
 			continue;
 		}
 
 		ctrl.valid = true;
 
 		if (!g_aimPoses || !g_aimPoses->valid[hand]) {
-			ctrl.valid = false;
+			invalidateTracking();
 			continue;
 		}
 
 		// --- Pose: position and forward direction ---
 		const auto& aim = g_aimPoses->matrix[hand];
-		ctrl.posX = aim.m[0][3];
-		ctrl.posY = aim.m[1][3];
-		ctrl.posZ = aim.m[2][3];
+		const PrismaUI::VRInput::Vec3 rawPosition{aim.m[0][3], aim.m[1][3], aim.m[2][3]};
 		// Aim pose -Z is the pointing direction (OpenXR convention)
-		ctrl.fwdX = -aim.m[0][2];
-		ctrl.fwdY = -aim.m[1][2];
-		ctrl.fwdZ = -aim.m[2][2];
-		float len = sqrtf(ctrl.fwdX * ctrl.fwdX + ctrl.fwdY * ctrl.fwdY + ctrl.fwdZ * ctrl.fwdZ);
-		if (len > 1e-6f) { ctrl.fwdX /= len; ctrl.fwdY /= len; ctrl.fwdZ /= len; }
+		const PrismaUI::VRInput::Vec3 rawDirection{-aim.m[0][2], -aim.m[1][2], -aim.m[2][2]};
+		const bool finitePose = std::isfinite(rawPosition.x) && std::isfinite(rawPosition.y) &&
+		                        std::isfinite(rawPosition.z) && std::isfinite(rawDirection.x) &&
+		                        std::isfinite(rawDirection.y) && std::isfinite(rawDirection.z);
+		if (!finitePose || PrismaUI::VRInput::Length(rawDirection) < 1.0e-6f) {
+			invalidateTracking();
+			continue;
+		}
+
+		const auto poseNow = std::chrono::steady_clock::now();
+		float poseDeltaSeconds = 0.0f;
+		if (ctrl.poseClockInitialized) {
+			poseDeltaSeconds = std::chrono::duration<float>(poseNow - ctrl.lastPoseTime).count();
+		}
+		ctrl.lastPoseTime = poseNow;
+		ctrl.poseClockInitialized = true;
+		PrismaUI::VRInput::Vec3 filteredPosition{};
+		PrismaUI::VRInput::Vec3 filteredDirection{};
+		ctrl.poseFilter.Update(rawPosition, rawDirection, poseDeltaSeconds,
+		                       g_vrInputConfig.poseFilter, filteredPosition, filteredDirection);
+		ctrl.posX = filteredPosition.x;
+		ctrl.posY = filteredPosition.y;
+		ctrl.posZ = filteredPosition.z;
+		ctrl.fwdX = filteredDirection.x;
+		ctrl.fwdY = filteredDirection.y;
+		ctrl.fwdZ = filteredDirection.z;
 
 
 		// --- Button state: universal across all headsets ---
@@ -1012,7 +1215,132 @@ static RayHit RayOverlayIntersection(const ControllerInfo& ctrl, const VROverlay
 // ============================================================================
 
 // Forward declaration — defined in Section 14c (after WndProc section)
-static void CheckTextInputFocusAsync(std::shared_ptr<PrismaUI::Core::PrismaView> view);
+static void CheckTextInputFocusAsync(std::shared_ptr<PrismaUI::Core::PrismaView> view,
+	uint64_t expectedViewId);
+
+// Capture exactly one scroll container under the laser. The reference lives in
+// the target view's JS window, so nested scroll panes do not bubble a generic
+// wheel event into their parents and separately positioned panels stay isolated.
+static void CaptureScrollTargetAsync(std::shared_ptr<PrismaUI::Core::PrismaView> view,
+	uint64_t viewId, int hand, int pixelX, int pixelY, uint64_t generation)
+{
+	if (hand < 0 || hand > 1)
+		return;
+	if (!view || !view->ultralightView) {
+		if (g_pointerInteractionGeneration[hand].load() == generation) {
+			g_interactiveDragActive[hand].store(true); // unknown: fail closed
+			g_scrollTargetCaptured[hand].store(false);
+			g_scrollTargetViewId[hand].store(0);
+			g_pointerProbePending[hand].store(false);
+		}
+		return;
+	}
+	PrismaUI::Core::ultralightThread.submit([view, viewId, hand, pixelX, pixelY, generation]() {
+		if (!view->ultralightView || g_pointerInteractionGeneration[hand].load() != generation) {
+			if (g_pointerInteractionGeneration[hand].load() == generation) {
+				g_interactiveDragActive[hand].store(true);
+				g_scrollTargetCaptured[hand].store(false);
+				g_scrollTargetViewId[hand].store(0);
+				g_pointerProbePending[hand].store(false);
+			}
+			return;
+		}
+		const std::string script =
+			"(function(){"
+			"var k='__prismaVrScrollTargets';if(!window[k])window[k]=[null,null];window[k][" +
+			std::to_string(hand) + "]=null;"
+			"var x=" + std::to_string(pixelX) + ",y=" + std::to_string(pixelY) + ";"
+			"function directDrag(n,s){var t=n.tagName||'',role=((n.getAttribute&&n.getAttribute('role'))||'').toLowerCase();"
+			"if((t==='INPUT'&&((n.getAttribute('type')||'').toLowerCase()==='range'))||role==='slider'||role==='scrollbar')return true;"
+			"if(n.getAttribute&&n.getAttribute('draggable')==='true')return true;"
+			"return s.cursor==='grab'||s.cursor==='grabbing'||s.cursor==='move'||s.cursor==='col-resize'||"
+			"s.cursor==='row-resize'||s.cursor==='ew-resize'||s.cursor==='ns-resize';}"
+			"function control(n,s){var t=n.tagName||'';"
+			"if(/^(BUTTON|INPUT|SELECT|TEXTAREA|OPTION|LABEL|SUMMARY|AUDIO|VIDEO|IFRAME)$/.test(t)||"
+			"(t==='A'&&n.getAttribute('href')!==null)||n.isContentEditable)return true;"
+			"var role=((n.getAttribute&&n.getAttribute('role'))||'').toLowerCase();"
+			"if(/^(button|slider|scrollbar|textbox|searchbox|combobox|checkbox|radio|link|spinbutton|switch|tab|option|listbox|treeitem|gridcell|menuitem|menuitemcheckbox|menuitemradio)$/.test(role))return true;"
+			"if((n.hasAttribute&&n.hasAttribute('onclick'))||typeof n.onclick==='function')return true;"
+			"return directDrag(n,s)||s.cursor==='pointer';}"
+			"function gutter(n,s,sx,sy){if(!n.getBoundingClientRect||!n.offsetWidth||!n.offsetHeight)return false;"
+			"var r=n.getBoundingClientRect(),kx=r.width/n.offsetWidth,ky=r.height/n.offsetHeight;"
+			"if(!isFinite(kx)||!isFinite(ky)||kx<=0||ky<=0)return false;"
+			"var lx=(x-r.left)/kx,ly=(y-r.top)/ky,cl=n.clientLeft,ct=n.clientTop,"
+			"cr=cl+n.clientWidth,cb=ct+n.clientHeight;"
+			"return (sy&&ly>=ct&&ly<cb&&(lx<cl||lx>=cr))||"
+			"(sx&&lx>=cl&&lx<cr&&(ly<ct||ly>=cb))||"
+			"(sx&&sy&&(lx<cl||lx>=cr)&&(ly<ct||ly>=cb));}"
+			"var e=document.elementFromPoint(x,y);if(!e)return '1';"
+			"var n=e,interactive=false,drag=false;while(n){"
+			"var s=window.getComputedStyle(n);"
+			"interactive=interactive||control(n,s);drag=drag||directDrag(n,s);"
+			"var oy=s.overflowY,ox=s.overflowX;"
+			"var sy=(oy==='scroll'||oy==='auto'||oy==='overlay')&&n.scrollHeight>n.clientHeight+1;"
+			"var sx=(ox==='scroll'||ox==='auto'||ox==='overlay')&&n.scrollWidth>n.clientWidth+1;"
+			"if(sx||sy){if(gutter(n,s,sx,sy)||drag)return '1';window[k][" +
+			std::to_string(hand) + "]=n;return '2';}"
+			"if(n===document.body||n===document.documentElement)break;n=n.parentElement;"
+			"}"
+			"var r=document.scrollingElement||document.documentElement;"
+			"if(r&&(r.scrollHeight>r.clientHeight+1||r.scrollWidth>r.clientWidth+1)){"
+			"var rs=window.getComputedStyle(r),rx=r.scrollWidth>r.clientWidth+1,ry=r.scrollHeight>r.clientHeight+1;"
+			"if(gutter(r,rs,rx,ry)||drag)return '1';window[k][" + std::to_string(hand) + "]=r;return '2';}"
+			"return interactive?'1':'0';"
+			"})()";
+		ultralight::String result = view->ultralightView->EvaluateScript(
+			ultralight::String(script.c_str()), nullptr, ultralight::String(""));
+		bool interactive = true; // An empty/error result must never turn a control into a panel grab.
+		bool capturedScrollTarget = false;
+		if (!result.empty()) {
+			const std::string text(result.utf8().data(), result.utf8().length());
+			interactive = text != "0" && text != "2";
+			capturedScrollTarget = text == "2";
+		}
+		if (g_pointerInteractionGeneration[hand].load() == generation) {
+			g_interactiveDragActive[hand].store(interactive);
+			g_scrollTargetCaptured[hand].store(capturedScrollTarget);
+			g_scrollTargetViewId[hand].store(capturedScrollTarget ? viewId : 0);
+			g_pointerProbePending[hand].store(false);
+		}
+	});
+}
+
+static void ScrollCapturedTarget(std::shared_ptr<PrismaUI::Core::PrismaView> view,
+	int hand, int deltaX, int deltaY)
+{
+	if (!view || (deltaX == 0 && deltaY == 0) || hand < 0 || hand > 1)
+		return;
+	PrismaVR_Bridge::RunJavaScript(view,
+		"(function(){var a=window.__prismaVrScrollTargets,t=a&&a[" + std::to_string(hand) + "];"
+		"if(!t||!(t===document.scrollingElement||document.documentElement.contains(t))){"
+		"if(a)a[" + std::to_string(hand) + "]=null;return;}"
+		"if(" + std::to_string(deltaX) + ")t.scrollLeft+=" + std::to_string(deltaX) + ";"
+		"if(" + std::to_string(deltaY) + ")t.scrollTop+=" + std::to_string(deltaY) + ";})()");
+}
+
+static void ScrollCapturedTargetForHand(std::shared_ptr<PrismaUI::Core::PrismaView> view,
+	int hand)
+{
+	if (!view || hand < 0 || hand > 1)
+		return;
+	auto& controller = g_controllers[hand];
+	const auto now = std::chrono::steady_clock::now();
+	float deltaSeconds = 0.0f;
+	if (controller.scrollClockInitialized) {
+		deltaSeconds = std::chrono::duration<float>(now - controller.lastScrollTime).count();
+		deltaSeconds = PrismaUI::VRInput::Clamp(deltaSeconds, 0.0f, 0.05f);
+	}
+	controller.lastScrollTime = now;
+	controller.scrollClockInitialized = true;
+
+	const int deltaX = PrismaUI::VRInput::AccumulateScrollDelta(
+		controller.thumbstickX, deltaSeconds, g_vrInputConfig.thumbstickDeadzone,
+		g_vrInputConfig.scrollPixelsPerSecond, controller.scrollRemainderX);
+	const int deltaY = PrismaUI::VRInput::AccumulateScrollDelta(
+		-controller.thumbstickY, deltaSeconds, g_vrInputConfig.thumbstickDeadzone,
+		g_vrInputConfig.scrollPixelsPerSecond, controller.scrollRemainderY);
+	ScrollCapturedTarget(view, hand, deltaX, deltaY);
+}
 
 // ProcessInput — Per-frame input processing: raycasting, cursor dots, mouse events.
 //
@@ -1029,22 +1357,125 @@ static void CheckTextInputFocusAsync(std::shared_ptr<PrismaUI::Core::PrismaView>
 //      cursor at a time (g_mouseActiveHand). This prevents two cursors fighting
 //      over one DOM. The active hand switches when the OTHER hand clicks a panel.
 //      - Trigger press → mouseDown + focus + interactive drag check
-//      - Trigger held → enter grab mode after TRIGGER_HOLD_THRESHOLD (unless
-//        the element under the cursor is a slider/scrollbar/draggable)
+//      - Trigger held half a second in a scroll pane → same-hand stick captures it
+//      - Trigger held on ordinary panel chrome → enter panel grab mode
 //      - Trigger release → mouseUp (completes click or ends interactive drag)
 //      - Every frame → mouseMove (hover tracking for CSS :hover, tooltips, etc.)
 //
-//   4. GRAB INITIATION: If trigger is held past the threshold and the DOM element
-//      is NOT interactive (slider, scrollbar), we cancel the pending click and
-//      enter grab mode. Actual grab movement is in ProcessGrabMoveResize().
+//   4. HOLD ROUTING: A captured scroll pane wins over panel movement. Its exact
+//      DOM node keeps the same controller's stick until trigger release. Outside
+//      scrollable content, the existing panel-grab behavior remains available.
 static void ProcessInput()
 {
 	auto visibleViews = PrismaVR_Bridge::GetVisibleViews();
+	auto findVisibleView = [&visibleViews](uint64_t viewId) -> std::shared_ptr<PrismaUI::Core::PrismaView> {
+		for (const auto& view : visibleViews) {
+			if (view.id == viewId)
+				return view.view;
+		}
+		return {};
+	};
+	auto finishPointerInteraction = [&findVisibleView](int hand, bool cancel, bool checkTextFocus) {
+		auto& controller = g_controllers[hand];
+		const bool hasState = controller.mouseDownActive || controller.pressedViewId != 0 ||
+		                      g_pointerProbePending[hand].load() ||
+		                      g_interactiveDragActive[hand].load() ||
+		                      g_scrollTargetCaptured[hand].load() ||
+		                      controller.scrollCaptureActive;
+		if (!hasState)
+			return;
+		auto pressedView = findVisibleView(controller.pressedViewId);
+		auto scrollView = findVisibleView(g_scrollTargetViewId[hand].load());
+		if (controller.mouseDownActive && pressedView) {
+			const int releaseX = cancel ? -1 : controller.pressedPixelX;
+			const int releaseY = cancel ? -1 : controller.pressedPixelY;
+			if (cancel) {
+				ultralight::MouseEvent cancelMove;
+				cancelMove.type = ultralight::MouseEvent::kType_MouseMoved;
+				cancelMove.x = releaseX;
+				cancelMove.y = releaseY;
+				cancelMove.button = ultralight::MouseEvent::kButton_None;
+				PrismaVR_Bridge::FireMouseEvent(pressedView, cancelMove);
+			}
+			ultralight::MouseEvent upEvent;
+			upEvent.type = ultralight::MouseEvent::kType_MouseUp;
+			upEvent.x = releaseX;
+			upEvent.y = releaseY;
+			upEvent.button = ultralight::MouseEvent::kButton_Left;
+			PrismaVR_Bridge::FireMouseEvent(pressedView, upEvent);
+			if (checkTextFocus)
+				CheckTextInputFocusAsync(pressedView, controller.pressedViewId);
+		}
+		g_pointerInteractionGeneration[hand].fetch_add(1);
+		g_pointerProbePending[hand].store(false);
+		g_interactiveDragActive[hand].store(false);
+		ClearCapturedScrollTarget(scrollView ? scrollView : pressedView, hand);
+		controller.mouseDownActive = false;
+		controller.pressedViewId = 0;
+		controller.scrollCaptureActive = false;
+		controller.scrollClockInitialized = false;
+		controller.scrollRemainderX = 0.0f;
+		controller.scrollRemainderY = 0.0f;
+	};
 
 	for (int hand = 0; hand < 2; hand++) {
 		auto& ctrl = g_controllers[hand];
 		if (!ctrl.valid) {
+			finishPointerInteraction(hand, true, false);
 			g_hitInfo[hand].hitting = false;
+			if (g_lastHitViewId[hand] != 0) {
+				auto oldView = findVisibleView(g_lastHitViewId[hand]);
+				if (oldView) {
+					const std::string dotId = "_pvrc" + std::to_string(hand);
+					PrismaVR_Bridge::RunJavaScript(oldView,
+						"var c=document.getElementById('" + dotId + "');if(c)c.style.display='none'");
+				}
+				g_lastHitViewId[hand] = 0;
+				g_lastCursorX[hand] = -1;
+				g_lastCursorY[hand] = -1;
+				g_cursorDotCreated[hand] = false;
+			}
+			continue;
+		}
+
+		// The DOM probe captured the pane at trigger-down, not wherever the laser
+		// happens to drift later. After one deliberate half-second, cancel the pending
+		// click and give this hand's own stick exclusively to that pane.
+		if (!ctrl.scrollCaptureActive && ctrl.triggerPressed && ctrl.triggerWasPressed &&
+		    ctrl.mouseDownActive && ctrl.pressedViewId != 0) {
+			const float heldSeconds = std::chrono::duration<float>(
+				std::chrono::steady_clock::now() - ctrl.triggerPressTime).count();
+			const bool targetMatchesPress = g_scrollTargetCaptured[hand].load() &&
+				g_scrollTargetViewId[hand].load() == ctrl.pressedViewId;
+			if (PrismaUI::VRInput::ShouldActivateScrollCapture(
+			        heldSeconds, targetMatchesPress, g_pointerProbePending[hand].load(),
+			        g_interactiveDragActive[hand].load(), SCROLL_CAPTURE_HOLD_THRESHOLD)) {
+				auto pressedView = findVisibleView(ctrl.pressedViewId);
+				if (pressedView) {
+					QueueCancelledMouseRelease(pressedView, ctrl);
+					g_pointerInteractionGeneration[hand].fetch_add(1);
+					g_pointerProbePending[hand].store(false);
+					g_interactiveDragActive[hand].store(false);
+					ctrl.mouseDownActive = false;
+					ctrl.pressedViewId = 0;
+					ctrl.scrollCaptureActive = true;
+					ctrl.scrollClockInitialized = false;
+					ctrl.scrollRemainderX = 0.0f;
+					ctrl.scrollRemainderY = 0.0f;
+					logger::info("PrismaVR: hand {} captured scroll pane after {:.2f}s hold",
+					             hand, heldSeconds);
+				}
+			}
+		}
+
+		if (ctrl.scrollCaptureActive) {
+			const uint64_t targetViewId = g_scrollTargetViewId[hand].load();
+			auto targetView = findVisibleView(targetViewId);
+			if (!ctrl.triggerPressed || !targetView || !g_scrollTargetCaptured[hand].load()) {
+				finishPointerInteraction(hand, true, false);
+			} else {
+				ScrollCapturedTargetForHand(targetView, hand);
+			}
 			continue;
 		}
 
@@ -1151,7 +1582,11 @@ static void ProcessInput()
 
 			// --- While grabbed or resizing, skip mouse/click events ---
 			if (ovl.isGrabbed || ovl.isResizing) {
-				// Don't send mouse events while manipulating the overlay
+				// Don't send mouse events while manipulating the overlay. A second
+				// hand may still own a press from another panel; cancel it so resize
+				// cannot swallow its MouseUp edge and leave the DOM latched.
+				if (ovl.grabbedByController != hand)
+					finishPointerInteraction(hand, true, false);
 			} else {
 				// --- Active hand: only one controller drives the Ultralight cursor ---
 				// Trigger press on EITHER hand activates that hand for mouse interaction.
@@ -1161,16 +1596,26 @@ static void ProcessInput()
 
 				// --- Trigger press: activate this hand + start click ---
 				if (ctrl.triggerPressed && !ctrl.triggerWasPressed) {
+					finishPointerInteraction(hand, true, false);
 					g_mouseActiveHand = hand;
 					isMouseHand = true;
 
 					ctrl.triggerPressTime = std::chrono::steady_clock::now();
-					g_interactiveDragActive.store(false); // Reset — will be set async if needed
+					g_interactiveDragActive[hand].store(false); // Reset — will be set async if needed
+					g_scrollTargetCaptured[hand].store(false);
+					g_scrollTargetViewId[hand].store(0);
+					g_pointerProbePending[hand].store(true);
+					const uint64_t interactionGeneration =
+						g_pointerInteractionGeneration[hand].fetch_add(1) + 1;
 
 					// Tell Ultralight this view has keyboard focus BEFORE the click,
 					// so the DOM processes mouseDown with focus already set (required
 					// for <input> clicks to set document.activeElement).
-					g_keyboardTargetViewId = bestViewId;
+					{
+						std::lock_guard lock(g_keyboardFocusStateMutex);
+						g_keyboardTargetViewId.store(bestViewId);
+						g_keyboardFocusGeneration.fetch_add(1);
+					}
 					PrismaVR_Bridge::FocusView(bestViewPtr);
 
 					ultralight::MouseEvent downEv;
@@ -1179,37 +1624,15 @@ static void ProcessInput()
 					downEv.y = pixelY;
 					downEv.button = ultralight::MouseEvent::kButton_Left;
 					PrismaVR_Bridge::FireMouseEvent(bestViewPtr, downEv);
+					ctrl.pressedViewId = bestViewId;
+					ctrl.pressedPixelX = pixelX;
+					ctrl.pressedPixelY = pixelY;
+					ctrl.mouseDownActive = true;
 
-					// Check if the clicked element is a slider, range input, or other
-					// drag-interactive element. If so, suppress grab mode so the HTML
-					// element can handle the drag (mousedown+mousemove+mouseup).
-					int px = pixelX, py = pixelY;
-					PrismaUI::Core::ultralightThread.submit([bestViewPtr, px, py]() {
-						if (!bestViewPtr->ultralightView) return;
-						std::string js = "(function(){"
-							"var e=document.elementFromPoint(" + std::to_string(px) + "," + std::to_string(py) + ");"
-							"if(!e)return '0';"
-							"var n=e;while(n&&n!==document.body){"
-							"if(n.tagName==='INPUT'&&n.type==='range')return '1';"
-							"if(n.getAttribute&&n.getAttribute('draggable')==='true')return '1';"
-							"var s=window.getComputedStyle(n);"
-							"if(s.cursor==='grab'||s.cursor==='grabbing'||s.cursor==='move')return '1';"
-							"if(s.overflowY==='scroll'||s.overflowY==='auto'||s.overflowX==='scroll'||s.overflowX==='auto'){"
-							"if(n.scrollHeight>n.clientHeight||n.scrollWidth>n.clientWidth)return '1';"
-							"}"
-							"n=n.parentElement;"
-							"}"
-							"return '0';"
-							"})()";
-						ultralight::String result = bestViewPtr->ultralightView->EvaluateScript(
-							ultralight::String(js.c_str()), nullptr, ultralight::String(""));
-						bool interactive = false;
-						if (!result.empty()) {
-							std::string r(result.utf8().data(), result.utf8().length());
-							interactive = (r == "1");
-						}
-						g_interactiveDragActive.store(interactive);
-					});
+					// Direct-drag controls keep native mouse drag. A selectable row inside
+					// a scroll pane still captures that exact pane for a deliberate hold.
+					CaptureScrollTargetAsync(bestViewPtr, bestViewId, hand, pixelX, pixelY,
+					                         interactionGeneration);
 				}
 
 				// --- Mouse move event (only active hand, every frame while pointing) ---
@@ -1220,58 +1643,64 @@ static void ProcessInput()
 					moveEv.y = pixelY;
 					moveEv.button = ultralight::MouseEvent::kButton_None;
 					PrismaVR_Bridge::FireMouseEvent(bestViewPtr, moveEv);
+					if (ctrl.mouseDownActive && ctrl.pressedViewId == bestViewId) {
+						ctrl.pressedPixelX = pixelX;
+						ctrl.pressedPixelY = pixelY;
+					}
 				}
 
-				// --- Trigger held: check if we should enter grab mode (any hand) ---
-				// Skip grab if an interactive HTML element (slider, scrollbar) is being dragged.
-				if (ctrl.triggerPressed && ctrl.triggerWasPressed && !g_interactiveDragActive.load()) {
+				// --- Trigger held: ordinary panel chrome may enter panel-grab mode ---
+				// Scroll panes are handled above and never move the panel.
+				if (ctrl.triggerPressed && ctrl.triggerWasPressed && ctrl.mouseDownActive &&
+				    ctrl.pressedViewId == bestViewId &&
+				    !g_pointerProbePending[hand].load() && !g_interactiveDragActive[hand].load() &&
+				    !g_scrollTargetCaptured[hand].load()) {
 					auto elapsed = std::chrono::duration<float>(
 						std::chrono::steady_clock::now() - ctrl.triggerPressTime).count();
 
-					if (elapsed >= TRIGGER_HOLD_THRESHOLD) {
-						// Cancel the pending click (if this is the mouse hand)
-						if (isMouseHand) {
+					if (elapsed >= PANEL_GRAB_HOLD_THRESHOLD) {
+						// Cancel the pending DOM click before moving the panel.
+						auto pressedView = findVisibleView(ctrl.pressedViewId);
+						if (ctrl.mouseDownActive && pressedView) {
+							ultralight::MouseEvent cancelMove;
+							cancelMove.type = ultralight::MouseEvent::kType_MouseMoved;
+							cancelMove.x = -1;
+							cancelMove.y = -1;
+							cancelMove.button = ultralight::MouseEvent::kButton_None;
+							PrismaVR_Bridge::FireMouseEvent(pressedView, cancelMove);
 							ultralight::MouseEvent upEv;
 							upEv.type = ultralight::MouseEvent::kType_MouseUp;
-							upEv.x = pixelX;
-							upEv.y = pixelY;
+							upEv.x = -1;
+							upEv.y = -1;
 							upEv.button = ultralight::MouseEvent::kButton_Left;
-							PrismaVR_Bridge::FireMouseEvent(bestViewPtr, upEv);
+							PrismaVR_Bridge::FireMouseEvent(pressedView, upEv);
 						}
+						ctrl.mouseDownActive = false;
+						ctrl.pressedViewId = 0;
 
 						ovl.isGrabbed = true;
 						ovl.grabbedByController = hand;
-						ovl.grabDistance = bestHit.distance; // Lock distance along laser ray
+						const auto anchor = PrismaUI::VRInput::CaptureGrabAnchor(
+							{ovl.posX, ovl.posY, ovl.posZ},
+							{ctrl.posX, ctrl.posY, ctrl.posZ},
+							{ctrl.fwdX, ctrl.fwdY, ctrl.fwdZ},
+							bestHit.distance);
+						ovl.grabDistance = anchor.distance;
+						ovl.grabOffX = anchor.offset.x;
+						ovl.grabOffY = anchor.offset.y;
+						ovl.grabOffZ = anchor.offset.z;
 					}
 				}
 
-				// --- Trigger release: complete click or end interactive drag (active hand only) ---
+				// --- Trigger release: complete a click or direct HTML drag ---
 				if (!ctrl.triggerPressed && ctrl.triggerWasPressed) {
-					if (isMouseHand) {
-						auto elapsed = std::chrono::duration<float>(
-							std::chrono::steady_clock::now() - ctrl.triggerPressTime).count();
-
-						// Send MouseUp on tap OR on release of interactive drag (slider/scrollbar).
-						// For interactive drags, the hold exceeded the threshold but grab was suppressed,
-						// so the HTML element still has mousedown active and needs a mouseup.
-						if (elapsed < TRIGGER_HOLD_THRESHOLD || g_interactiveDragActive.load()) {
-							ultralight::MouseEvent upEv;
-							upEv.type = ultralight::MouseEvent::kType_MouseUp;
-							upEv.x = pixelX;
-							upEv.y = pixelY;
-							upEv.button = ultralight::MouseEvent::kButton_Left;
-							PrismaVR_Bridge::FireMouseEvent(bestViewPtr, upEv);
-
-							// After click completes, check if the focused element is a text input.
-							CheckTextInputFocusAsync(bestViewPtr);
-						}
-					}
-					g_interactiveDragActive.store(false);
+					const bool releasedOnPressedView = ctrl.pressedViewId == bestViewId;
+					finishPointerInteraction(hand, !releasedOnPressedView, releasedOnPressedView);
 				}
 			}
 
-			// Scroll is handled in ProcessGrabMoveResize (while panel is held).
-			// No scroll while just pointing — thumbstick moves the player normally.
+			// Outside an active half-second scroll capture, the stick keeps its normal
+			// game behavior. A quick trigger tap remains a normal DOM selection.
 
 			// Grip button is NOT used for Prisma UI — it stays free for game interaction.
 			// Prisma menus are controlled by hotkeys.
@@ -1292,6 +1721,8 @@ static void ProcessInput()
 				g_lastCursorY[hand] = -1;
 				g_cursorDotCreated[hand] = false;
 			}
+			if (!ctrl.triggerPressed && ctrl.triggerWasPressed)
+				finishPointerInteraction(hand, true, false);
 			hitState.hitting = false;
 		}
 
@@ -1320,9 +1751,9 @@ static float ControllerDistance(const ControllerInfo& a, const ControllerInfo& b
 	return sqrtf(dx * dx + dy * dy + dz * dz);
 }
 
-// ProcessGrabMoveResize — Handles panel movement, resizing, and scroll while grabbed.
+// ProcessGrabMoveResize — Handles panel movement and resizing.
 //
-// Grab mode is entered by ProcessInput() when trigger is held past the threshold.
+// Grab mode is entered by ProcessInput() when ordinary panel chrome is held.
 // Once grabbed, the overlay follows the controller's laser ray at a locked distance.
 //
 // Two-hand resize:
@@ -1332,13 +1763,22 @@ static float ControllerDistance(const ControllerInfo& a, const ControllerInfo& b
 //   Both thumbsticks can push/pull the panel depth during resize.
 //
 // Single-hand grab:
-//   Panel follows the aiming ray at the original grab distance. The grabbing hand's
-//   thumbstick Y scrolls the panel content. The OTHER hand's thumbstick Y adjusts
-//   the grab distance (push panel farther or pull it closer).
+//   Panel follows the aiming ray while preserving the exact point where it was
+//   grabbed. The other hand's Y axis adjusts panel depth. Scroll panes never
+//   enter this path; they use dedicated same-hand capture in ProcessInput().
 //
 // On trigger release, the panel world-locks at its current position.
 static void ProcessGrabMoveResize()
 {
+	const auto visibleViews = PrismaVR_Bridge::GetVisibleViews();
+	auto findView = [&visibleViews](uint64_t viewId) -> std::shared_ptr<PrismaUI::Core::PrismaView> {
+		for (const auto& view : visibleViews) {
+			if (view.id == viewId)
+				return view.view;
+		}
+		return {};
+	};
+
 	for (auto& [viewId, ovl] : g_vrOverlays) {
 		if (!ovl.isGrabbed || ovl.grabbedByController < 0 || ovl.grabbedByController > 1)
 			continue;
@@ -1349,6 +1789,10 @@ static void ProcessGrabMoveResize()
 		auto& otherCtrl = g_controllers[otherHand];
 
 		if (!ctrl.valid) {
+			g_pointerInteractionGeneration[grabHand].fetch_add(1);
+			g_pointerProbePending[grabHand].store(false);
+			g_interactiveDragActive[grabHand].store(false);
+			ClearCapturedScrollTarget(findView(viewId), grabHand);
 			ovl.isGrabbed = false;
 			ovl.isResizing = false;
 			ovl.grabbedByController = -1;
@@ -1384,58 +1828,67 @@ static void ProcessGrabMoveResize()
 			ovl.posY = (ctrl.posY + otherCtrl.posY) * 0.5f;
 			ovl.posZ = (ctrl.posZ + otherCtrl.posZ) * 0.5f;
 
-			// Thumbstick Y while both triggers held: push/pull panel distance
-			// Use whichever thumbstick has more deflection
+			// Keep the existing resize push/pull control.
 			float stickY = (fabsf(ctrl.thumbstickY) > fabsf(otherCtrl.thumbstickY))
 				? ctrl.thumbstickY : otherCtrl.thumbstickY;
-			if (fabsf(stickY) > THUMBSTICK_DEADZONE) {
+			if (fabsf(stickY) > MANIPULATION_THUMBSTICK_DEADZONE) {
 				float speed = stickY * RESIZE_PUSH_PULL_SPEED;
 				ovl.posX += ovl.fwdX * speed;
 				ovl.posY += ovl.fwdY * speed;
 				ovl.posZ += ovl.fwdZ * speed;
 			}
 
+			// Keep the primary ray anchor current throughout resize. Exiting resize
+			// can then continue from this exact center without a one-frame jump.
+			const auto resizedAnchor = PrismaUI::VRInput::ReanchorGrabAtCurrentPosition(
+				{ovl.posX, ovl.posY, ovl.posZ},
+				{ctrl.posX, ctrl.posY, ctrl.posZ},
+				{ctrl.fwdX, ctrl.fwdY, ctrl.fwdZ},
+				MIN_GRAB_DISTANCE, MAX_GRAB_DISTANCE);
+			ovl.grabDistance = resizedAnchor.distance;
+			ovl.grabOffX = resizedAnchor.offset.x;
+			ovl.grabOffY = resizedAnchor.offset.y;
+			ovl.grabOffZ = resizedAnchor.offset.z;
+
 		} else {
 			// Second trigger released — exit resize mode
 			if (ovl.isResizing) {
 				ovl.isResizing = false;
-				// Re-calculate grab distance from current position
-				float dx = ovl.posX - ctrl.posX;
-				float dy = ovl.posY - ctrl.posY;
-				float dz = ovl.posZ - ctrl.posZ;
-				ovl.grabDistance = sqrtf(dx * dx + dy * dy + dz * dz);
+				// Re-anchor at the current resized position. This makes the first
+				// single-hand frame continuous instead of snapping back to the ray.
+				const auto anchor = PrismaUI::VRInput::ReanchorGrabAtCurrentPosition(
+					{ovl.posX, ovl.posY, ovl.posZ},
+					{ctrl.posX, ctrl.posY, ctrl.posZ},
+					{ctrl.fwdX, ctrl.fwdY, ctrl.fwdZ},
+					MIN_GRAB_DISTANCE, MAX_GRAB_DISTANCE);
+				ovl.grabDistance = anchor.distance;
+				ovl.grabOffX = anchor.offset.x;
+				ovl.grabOffY = anchor.offset.y;
+				ovl.grabOffZ = anchor.offset.z;
 			}
 
-			// Ray-based grab: panel follows the laser aim direction at fixed distance
-			ovl.posX = ctrl.posX + ctrl.fwdX * ovl.grabDistance;
-			ovl.posY = ctrl.posY + ctrl.fwdY * ovl.grabDistance;
-			ovl.posZ = ctrl.posZ + ctrl.fwdZ * ovl.grabDistance;
-
-			// Grabbing hand's thumbstick Y: scroll the panel content
-			if (fabsf(ctrl.thumbstickY) > THUMBSTICK_DEADZONE) {
-				auto views = PrismaVR_Bridge::GetVisibleViews();
-				for (auto& vi : views) {
-					if (vi.id == viewId) {
-						ultralight::ScrollEvent scrollEv;
-						scrollEv.type = ultralight::ScrollEvent::kType_ScrollByPixel;
-						scrollEv.delta_x = 0;
-						scrollEv.delta_y = (int)(ctrl.thumbstickY * -SCROLL_DELTA_MULTIPLIER);
-						PrismaVR_Bridge::FireScrollEvent(vi.view, scrollEv);
-						break;
-					}
-				}
-			}
-
-			// Non-grabbing hand's thumbstick Y: push/pull panel distance along ray
-			if (otherCtrl.valid && fabsf(otherCtrl.thumbstickY) > THUMBSTICK_DEADZONE) {
+			// The non-grabbing hand keeps panel push/pull behavior.
+			if (otherCtrl.valid && fabsf(otherCtrl.thumbstickY) > MANIPULATION_THUMBSTICK_DEADZONE) {
 				ovl.grabDistance += otherCtrl.thumbstickY * DEPTH_ADJUST_SPEED;
 				if (ovl.grabDistance < MIN_GRAB_DISTANCE) ovl.grabDistance = MIN_GRAB_DISTANCE;
 				if (ovl.grabDistance > MAX_GRAB_DISTANCE) ovl.grabDistance = MAX_GRAB_DISTANCE;
 			}
+
+			const auto panelCenter = PrismaUI::VRInput::ResolveGrabbedPanelCenter(
+				{ctrl.posX, ctrl.posY, ctrl.posZ},
+				{ctrl.fwdX, ctrl.fwdY, ctrl.fwdZ},
+				{ovl.grabDistance, {ovl.grabOffX, ovl.grabOffY, ovl.grabOffZ}});
+			ovl.posX = panelCenter.x;
+			ovl.posY = panelCenter.y;
+			ovl.posZ = panelCenter.z;
 		}
 
 		// --- Grab release: primary trigger released ---
 		if (!ctrl.triggerPressed) {
+			g_pointerInteractionGeneration[grabHand].fetch_add(1);
+			g_pointerProbePending[grabHand].store(false);
+			g_interactiveDragActive[grabHand].store(false);
+			ClearCapturedScrollTarget(findView(viewId), grabHand);
 			ovl.isGrabbed = false;
 			ovl.isResizing = false;
 			ovl.grabbedByController = -1;
@@ -1704,13 +2157,13 @@ static void CleanupDistantOverlays()
 
 // ============================================================================
 // Section 14b: Game control masking
-// Movement: ControlMap (global) — masked only during grab.
+// Movement: ControlMap (global) — masked during panel manipulation or scroll capture.
 // ============================================================================
 
-// UpdateControlMasking — Freezes movement while grabbing a Prisma panel.
+// UpdateControlMasking — Freezes movement while manipulating a panel or pane.
 //
-// Walking while dragging a panel would be disorienting, so we freeze movement
-// via Skyrim's ControlMap. Unmasked as soon as grab ends.
+// Walking while dragging a panel or using its stick-scroll capture would steal
+// the same input and be disorienting. Unmask immediately when interaction ends.
 static void UpdateControlMasking()
 {
 	if (g_vrOverlays.empty()) {
@@ -1723,10 +2176,11 @@ static void UpdateControlMasking()
 	// with an open Prisma panel. Hover alone must not disable Skyrim's fighting
 	// group; in VR that group owns weapon fire, spell fire, and combat stance.
 	auto triggerOnOpenPanel = [](int hand) {
-		return g_controllers[hand].valid &&
+		return g_controllers[hand].scrollCaptureActive ||
+		       (g_controllers[hand].valid &&
 		       g_controllers[hand].triggerPressed &&
 		       g_hitInfo[hand].hitting &&
-		       g_vrOverlays.find(g_hitInfo[hand].hitViewId) != g_vrOverlays.end();
+		       g_vrOverlays.find(g_hitInfo[hand].hitViewId) != g_vrOverlays.end());
 	};
 	bool anyTriggerOnPanel = triggerOnOpenPanel(0) || triggerOnOpenPanel(1);
 	if (anyTriggerOnPanel && !g_combatMasked) {
@@ -1739,15 +2193,18 @@ static void UpdateControlMasking()
 		g_combatMasked = false;
 	}
 
-	// Movement: mask only when grabbing
-	bool anyGrabbing = false;
+	// Movement: mask while grabbing or while a same-hand scroll capture owns a stick.
+	bool anyManipulating = g_controllers[0].scrollCaptureActive ||
+	                       g_controllers[1].scrollCaptureActive;
 	for (auto& [id, ovl] : g_vrOverlays) {
-		if (ovl.isGrabbed) { anyGrabbing = true; break; }
+		if (ovl.isGrabbed) { anyManipulating = true; break; }
 	}
-	if (anyGrabbing && !g_movementMasked) {
+	if (anyManipulating && !g_movementMasked) {
+		logger::info("PrismaVR: masking movement controls (panel manipulation)");
 		PrismaVR_Bridge::MaskMovement();
 		g_movementMasked = true;
-	} else if (!anyGrabbing && g_movementMasked) {
+	} else if (!anyManipulating && g_movementMasked) {
+		logger::info("PrismaVR: unmasking movement controls (panel manipulation ended)");
 		PrismaVR_Bridge::UnmaskMovement();
 		g_movementMasked = false;
 	}
@@ -1772,9 +2229,10 @@ static BOOL CALLBACK FindGameWindowProc(HWND hwnd, LPARAM lParam) {
 
 static std::shared_ptr<PrismaUI::Core::PrismaView> FindKeyboardTargetView()
 {
+	const uint64_t targetViewId = g_keyboardTargetViewId.load();
 	auto views = PrismaVR_Bridge::GetVisibleViews();
 	for (auto& vi : views) {
-		if (vi.id == g_keyboardTargetViewId)
+		if (vi.id == targetViewId)
 			return vi.view;
 	}
 	return nullptr;
@@ -1784,11 +2242,16 @@ static std::shared_ptr<PrismaUI::Core::PrismaView> FindKeyboardTargetView()
 // Submits a JS eval to the Ultralight thread; result updates g_textInputFocused.
 // Called after each laser click and periodically (~every 10 frames) to catch
 // Enter/Tab/click-away that blur the field.
-static void CheckTextInputFocusAsync(std::shared_ptr<PrismaUI::Core::PrismaView> view)
+static void CheckTextInputFocusAsync(std::shared_ptr<PrismaUI::Core::PrismaView> view,
+	uint64_t expectedViewId)
 {
-	if (!view || !view->ultralightView) return;
-	PrismaUI::Core::ultralightThread.submit([view]() {
-		if (!view->ultralightView) return;
+	if (!view || !view->ultralightView || g_keyboardTargetViewId.load() != expectedViewId)
+		return;
+	const uint64_t expectedGeneration = g_keyboardFocusGeneration.load();
+	PrismaUI::Core::ultralightThread.submit([view, expectedViewId, expectedGeneration]() {
+		if (!view->ultralightView || g_keyboardTargetViewId.load() != expectedViewId ||
+		    g_keyboardFocusGeneration.load() != expectedGeneration)
+			return;
 		ultralight::String result = view->ultralightView->EvaluateScript(
 			ultralight::String(
 				"(function(){"
@@ -1810,6 +2273,10 @@ static void CheckTextInputFocusAsync(std::shared_ptr<PrismaUI::Core::PrismaView>
 			std::string r(result.utf8().data(), result.utf8().length());
 			focused = (r.find('1') != std::string::npos);
 		}
+		std::lock_guard lock(g_keyboardFocusStateMutex);
+		if (g_keyboardTargetViewId.load() != expectedViewId ||
+		    g_keyboardFocusGeneration.load() != expectedGeneration)
+			return;
 		bool prev = g_textInputFocused.exchange(focused);
 		if (focused != prev) {
 			logger::info("PrismaVR: text input focus changed: {} (raw result: '{}', gameHwnd=0x{:X})",
@@ -1852,13 +2319,14 @@ static LRESULT CALLBACK PrismaVR_KBSubclassProc(
 {
 	// Only intercept keyboard when VR is active AND a text input field has focus.
 	// When no text field is focused, keys pass through as normal game hotkeys.
+	const uint64_t keyboardTargetViewId = g_keyboardTargetViewId.load();
 	bool canIntercept = g_vrActive && !g_vrOverlays.empty()
-	                    && g_keyboardTargetViewId != 0
+	                    && keyboardTargetViewId != 0
 	                    && g_textInputFocused.load();
 
 	if (uMsg == WM_OC_CHAR && !canIntercept) {
 		logger::warn("PrismaVR: WM_OC_CHAR DROPPED — canIntercept=false (vrActive={}, overlays={}, targetId={}, textFocused={})",
-			g_vrActive, !g_vrOverlays.empty(), g_keyboardTargetViewId, g_textInputFocused.load());
+			g_vrActive, !g_vrOverlays.empty(), keyboardTargetViewId, g_textInputFocused.load());
 	}
 
 	if (canIntercept) {
@@ -1928,7 +2396,7 @@ static LRESULT CALLBACK PrismaVR_KBSubclassProc(
 		if (uMsg == WM_OC_CHAR) {
 			wchar_t ch = static_cast<wchar_t>(wParam);
 			LPARAM mode = lParam; // 0 = printable char, 1 = control key
-			logger::info("PrismaVR: WM_OC_CHAR received — ch={} mode={} targetViewId={}", (int)ch, (int)mode, g_keyboardTargetViewId);
+			logger::info("PrismaVR: WM_OC_CHAR received — ch={} mode={} targetViewId={}", (int)ch, (int)mode, keyboardTargetViewId);
 
 			auto targetView = FindKeyboardTargetView();
 			if (targetView) {
@@ -2015,6 +2483,7 @@ namespace PrismaVR {
 
 	void Initialize()
 	{
+		LoadVRInputConfig();
 		g_vrActive = DetectVR();
 		if (g_vrActive) {
 			// Game window search is deferred to OnFrame() — at Initialize() time the
@@ -2068,6 +2537,7 @@ namespace PrismaVR {
 			HWND found = nullptr;
 			EnumWindows(FindGameWindowProc, reinterpret_cast<LPARAM>(&found));
 			if (found) {
+				std::lock_guard lock(g_keyboardFocusStateMutex);
 				g_gameHwnd = found;
 				SetWindowSubclass(g_gameHwnd, PrismaVR_KBSubclassProc, PRISMAVR_SUBCLASS_ID, 0);
 				logger::info("PrismaVR: Game window found (deferred), WndProc subclass installed. HWND=0x{:X}",
@@ -2105,9 +2575,13 @@ namespace PrismaVR {
 			g_hitInfo[1].hitting = false;
 			g_mouseActiveHand = -1;
 			// No panels open — keyboard goes back to normal hotkey mode
-			g_keyboardTargetViewId = 0;
-			g_textInputFocused.store(false);
-			if (g_gameHwnd) RemovePropW(g_gameHwnd, L"OC_PRISMA_TEXT");
+			{
+				std::lock_guard lock(g_keyboardFocusStateMutex);
+				g_keyboardTargetViewId.store(0);
+				g_keyboardFocusGeneration.fetch_add(1);
+				g_textInputFocused.store(false);
+				if (g_gameHwnd) RemovePropW(g_gameHwnd, L"OC_PRISMA_TEXT");
+			}
 			// Do NOT call HideKeyboard here — it maps to OC's BaseOverlay::HideKeyboard()
 			// which destroys the user's VR keyboard (including shortcut-opened ones).
 			return;
@@ -2130,9 +2604,10 @@ namespace PrismaVR {
 		// Poll text input focus state every ~10 frames (~110ms at 90fps).
 		// Catches Enter/Tab/click-away that blur the text field without a new laser click.
 		static int textFocusPollFrame = 0;
-		if (++textFocusPollFrame % TEXT_FOCUS_POLL_FRAMES == 0 && g_keyboardTargetViewId != 0) {
+		const uint64_t keyboardTargetViewId = g_keyboardTargetViewId.load();
+		if (++textFocusPollFrame % TEXT_FOCUS_POLL_FRAMES == 0 && keyboardTargetViewId != 0) {
 			auto tv = FindKeyboardTargetView();
-			if (tv) CheckTextInputFocusAsync(tv);
+			if (tv) CheckTextInputFocusAsync(tv, keyboardTargetViewId);
 		}
 
 		// OCU owns Prisma text input through OC_PRISMA_TEXT and direct delivery.
@@ -2155,6 +2630,19 @@ namespace PrismaVR {
 	void Shutdown()
 	{
 		if (!g_vrActive) return;
+
+		// Invalidate async DOM probes before any overlay/view teardown. Cancel
+		// active presses while their shared view can still be resolved.
+		const uint64_t pressedViewIds[2] = {
+			g_controllers[0].pressedViewId,
+			g_controllers[1].pressedViewId
+		};
+		for (uint64_t pressedViewId : pressedViewIds) {
+			if (pressedViewId != 0)
+				CancelPointerStateForView(pressedViewId, PrismaVR_Bridge::FindView(pressedViewId));
+		}
+		for (int hand = 0; hand < 2; ++hand)
+			ResetPointerState(hand);
 
 		// Unmask all controls on shutdown
 		if (g_combatMasked) { PrismaVR_Bridge::UnmaskCombatControls(); g_combatMasked = false; }
@@ -2184,12 +2672,17 @@ namespace PrismaVR {
 		g_vrOverlays.clear();
 
 		// Remove VR keyboard WndProc subclass and Prisma text property
-		if (g_gameHwnd) {
-			RemovePropW(g_gameHwnd, L"OC_PRISMA_TEXT");
-			RemoveWindowSubclass(g_gameHwnd, PrismaVR_KBSubclassProc, PRISMAVR_SUBCLASS_ID);
-			g_gameHwnd = nullptr;
+		{
+			std::lock_guard lock(g_keyboardFocusStateMutex);
+			if (g_gameHwnd) {
+				RemovePropW(g_gameHwnd, L"OC_PRISMA_TEXT");
+				RemoveWindowSubclass(g_gameHwnd, PrismaVR_KBSubclassProc, PRISMAVR_SUBCLASS_ID);
+				g_gameHwnd = nullptr;
+			}
+			g_keyboardTargetViewId.store(0);
+			g_keyboardFocusGeneration.fetch_add(1);
+			g_textInputFocused.store(false);
 		}
-		g_keyboardTargetViewId = 0;
 
 		g_overlay = nullptr;
 		g_system = nullptr;
@@ -2267,7 +2760,7 @@ extern "C" __declspec(dllexport) void PrismaVR_DeliverChar(wchar_t ch)
 	// condition is false, silently drop — OC will skip the call in those cases.
 	if (!g_vrActive) return;
 	if (g_vrOverlays.empty()) return;
-	if (g_keyboardTargetViewId == 0) return;
+	if (g_keyboardTargetViewId.load() == 0) return;
 	if (!g_textInputFocused.load()) return;
 
 	auto targetView = FindKeyboardTargetView();
@@ -2342,7 +2835,7 @@ extern "C" __declspec(dllexport) void PrismaVR_DeliverVKey(int vkCode)
 {
 	if (!g_vrActive) return;
 	if (g_vrOverlays.empty()) return;
-	if (g_keyboardTargetViewId == 0) return;
+	if (g_keyboardTargetViewId.load() == 0) return;
 	if (!g_textInputFocused.load()) return;
 
 	auto targetView = FindKeyboardTargetView();

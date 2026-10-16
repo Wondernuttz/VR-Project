@@ -44,6 +44,17 @@ Per-frame flow in `D3DPresent`:
 3. `ultralightThread.submit(ViewRenderer::RenderViews)` — BitmapSurface → `pixelBuffer`
 4. Game thread: `pixelBuffer` → D3D11 texture (Map/Unmap), SpriteBatch draw sorted by `view->order`
 
+## SKSE task submission
+
+All SKSE task/UI-task submissions must go through `PrismaUI::Tasks`. SKSE VR
+holds its task queue lock while executing tasks; a task can then wait for the
+renderer lock. `D3DPresent` already owns that renderer lock, so calling native
+`AddTask` from rendering deadlocks. The browser also must use the dispatcher:
+rendering waits for browser futures, so blocking the browser on SKSE recreates
+the same cycle. The relay only submits; callbacks still execute through SKSE.
+Never wait for relay delivery from rendering/browser code. Its process-lifetime
+worker is intentionally not joined during render teardown or DLL detach.
+
 ## View lifecycle
 
 ```text
@@ -129,6 +140,24 @@ cursor dot swaps to matching blue in `ProcessInput()`. Gotcha: overlay quad
 height = widthMeters × (texH/texW), so `BEAM_TEX_H` is derived from
 `LASER_LENGTH / LASER_WIDTH` — changing beam length/width constants without
 keeping that ratio stretches the taper.
+
+## VR panel grab and scrolling (2026-08-19)
+
+- Panel grabs preserve the original world-space hit offset; never place the
+  panel center directly on the ray. Re-anchor that offset after two-hand resize
+  so returning to a single hand is position-continuous.
+- Trigger-down asynchronously classifies the DOM point. Unknown, null, or stale
+  results fail closed. Native scrollbar gutters and direct controls keep their
+  DOM drag and must never begin a panel grab.
+- A scroll pane is bound to the hand and view identified at trigger-down. A
+  half-second hold cancels the pending click without moving the panel, masks
+  Skyrim movement, and routes that same hand's stick only to the exact pane
+  until release. Quick taps still click; selectable rows inside a pane remain
+  scroll-capturable, while sliders and other direct-drag controls keep native drag.
+- Panel grabbing remains a separate hold on non-scrollable chrome. During a
+  panel grab, the opposite hand's Y axis retains depth control.
+- Tracking loss, release, view teardown, and shutdown must invalidate the async
+  generation and clear both the native target identity and its JS reference.
 
 ## Other gotchas
 

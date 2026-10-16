@@ -2,6 +2,7 @@
 #include "Menus/CursorMenu/CursorMenu.h"
 #include "PrismaUI_API.h"
 #include "Utils/DllLoader.h"
+#include "PrismaUI/TaskDispatcher.h"
 #include <spdlog/sinks/basic_file_sink.h>
 
 static void SKSEMessageHandler(SKSE::MessagingInterface::Message *message) {
@@ -36,6 +37,10 @@ SKSEPlugin_Load(const SKSE::LoadInterface *a_skse) {
 
     if (!g_messaging) {
         logger::critical("Failed to load messaging interface! This error is fatal, plugin will not load.");
+        return false;
+    }
+
+    if (!PrismaUI::Tasks::Initialize()) {
         return false;
     }
 

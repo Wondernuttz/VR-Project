@@ -1,5 +1,7 @@
 ﻿#pragma once
 
+#include <atomic>
+#include <cstdint>
 #include <thread>
 #include <mutex>
 #include <condition_variable>

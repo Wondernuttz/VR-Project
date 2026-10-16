@@ -1,5 +1,7 @@
 ﻿#include "FocusMenu.h"
 
+#include "PrismaUI/TaskDispatcher.h"
+
 RE::stl::owner<RE::IMenu*> FocusMenu::Creator()
 {
 	auto menu = new FocusMenu();
@@ -63,7 +65,7 @@ bool FocusMenu::IsOpen()
 
 void FocusMenu::Open()
 {
-	SKSE::GetTaskInterface()->AddUITask([=] {
+	PrismaUI::Tasks::AddUITask([=] {
 		auto ui = RE::UI::GetSingleton();
 		auto msgQ = RE::UIMessageQueue::GetSingleton();
 
@@ -75,7 +77,7 @@ void FocusMenu::Open()
 
 void FocusMenu::Close()
 {
-	SKSE::GetTaskInterface()->AddUITask([=] {
+	PrismaUI::Tasks::AddUITask([=] {
 		auto ui = RE::UI::GetSingleton();
 		auto msgQ = RE::UIMessageQueue::GetSingleton();
 

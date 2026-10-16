@@ -18,11 +18,14 @@ set(CMAKE_JOB_POOL_COMPILE compile)
 set(CMAKE_JOB_POOL_LINK link)
 set(CMAKE_INSTALL_MESSAGE LAZY)
 
-project(PrismaUI VERSION 1.5.0 LANGUAGES CXX)
+project(PrismaUI VERSION 1.5.0.82 LANGUAGES CXX)
+
+option(PRISMA_BUILD_VR_INPUT_TESTS "Build standalone VR input filter tests" OFF)
+option(PRISMA_BUILD_TASK_RELAY_TESTS "Build task submission deadlock regression tests" OFF)
 
 # Set build root for external builds
 list(APPEND CMAKE_MODULE_PATH "${PROJECT_SOURCE_DIR}/cmake")
-set(BUILD_ROOT "${CMAKE_SOURCE_DIR}/build")
+set(BUILD_ROOT "${CMAKE_SOURCE_DIR}/build" CACHE PATH "Root for external dependency builds")
 
 # Include compiler flags configuration
 include(CompilerFlags)
@@ -97,6 +100,21 @@ target_precompile_headers(${PROJECT_NAME}
 )
 add_external_dependencies(${PROJECT_NAME})
 
+if(PRISMA_BUILD_VR_INPUT_TESTS)
+    enable_testing()
+    add_executable(PrismaVRInputTests tests/VRInputFiltersTests.cpp)
+    target_include_directories(PrismaVRInputTests PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src")
+    add_test(NAME PrismaVRInputTests COMMAND PrismaVRInputTests)
+endif()
+
+if(PRISMA_BUILD_TASK_RELAY_TESTS)
+    enable_testing()
+    add_executable(PrismaTaskRelayTests tests/TaskRelayTests.cpp)
+    target_include_directories(PrismaTaskRelayTests PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src")
+    add_test(NAME PrismaTaskRelayTests COMMAND PrismaTaskRelayTests)
+    set_tests_properties(PrismaTaskRelayTests PROPERTIES TIMEOUT 20)
+endif()
+
 # Set output directory
 set_target_properties(${PROJECT_NAME} PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
@@ -111,6 +129,9 @@ add_custom_command(TARGET ${PROJECT_NAME} POST_BUILD
     "$<TARGET_FILE_DIR:${PROJECT_NAME}>"
     COMMAND ${CMAKE_COMMAND} -E copy
     "${CMAKE_SOURCE_DIR}/PrismaUI_ModelPreview.ini"
+    "$<TARGET_FILE_DIR:${PROJECT_NAME}>"
+    COMMAND ${CMAKE_COMMAND} -E copy
+    "${CMAKE_SOURCE_DIR}/PrismaUI_VR.ini"
     "$<TARGET_FILE_DIR:${PROJECT_NAME}>"
     COMMAND "${CMAKE_COMMAND}" -E echo "Copying Ultralight DLLs to output directory"
 )
@@ -139,6 +160,9 @@ add_custom_command(TARGET ${PROJECT_NAME} POST_BUILD
 
     # Copy ModelPreview ini template to SKSE/plugins
     COMMAND ${CMAKE_COMMAND} -E copy "${CMAKE_SOURCE_DIR}/PrismaUI_ModelPreview.ini" "${DIST_SKSE_PLUGINS_DIR}/"
+
+    # Copy VR input ini template to SKSE/plugins
+    COMMAND ${CMAKE_COMMAND} -E copy "${CMAKE_SOURCE_DIR}/PrismaUI_VR.ini" "${DIST_SKSE_PLUGINS_DIR}/"
 
     # Copy PrismaUI PDB to SKSE/plugins (if exists)
     COMMAND ${CMAKE_COMMAND} -E $<IF:$<BOOL:$<TARGET_PDB_FILE:${PROJECT_NAME}>>,copy,true>

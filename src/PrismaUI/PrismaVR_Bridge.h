@@ -4,6 +4,7 @@
 // If Prisma renames a field, only this file needs a one-line fix.
 
 #include "Core.h"
+#include "TaskDispatcher.h"
 
 #pragma warning(push)
 #pragma warning(disable : 4100)
@@ -63,6 +64,12 @@ namespace PrismaVR_Bridge {
 		return result;
 	}
 
+	inline std::shared_ptr<PrismaUI::Core::PrismaView> FindView(uint64_t viewId) {
+		std::shared_lock lock(PrismaUI::Core::viewsMutex);
+		auto it = PrismaUI::Core::views.find(viewId);
+		return it != PrismaUI::Core::views.end() ? it->second : nullptr;
+	}
+
 	// --- Event injection (submits to Ultralight thread, fire-and-forget) ---
 
 	inline void FireMouseEvent(std::shared_ptr<PrismaUI::Core::PrismaView> view,
@@ -115,12 +122,12 @@ namespace PrismaVR_Bridge {
 	//
 	// ToggleControls mutates the game's live input state and is NOT safe from the
 	// render thread (PrismaVR::OnFrame) — it races the game thread's input
-	// processing. All toggles are queued through the SKSE task interface so they
-	// execute on the game thread; AddTask preserves FIFO order, so rapid
-	// mask/unmask sequences from laser clicks apply in the order they were issued.
+	// processing. The dispatcher submits to SKSE outside the renderer lock;
+	// directly calling SKSE AddTask here can deadlock against a task that needs
+	// the renderer. Toggles still execute via SKSE in mask/unmask FIFO order.
 
 	inline void ToggleControlsOnGameThread(RE::UserEvents::USER_EVENT_FLAG flag, bool enable) {
-		SKSE::GetTaskInterface()->AddTask([flag, enable]() {
+		PrismaUI::Tasks::AddTask([flag, enable]() {
 			auto controlMap = RE::ControlMap::GetSingleton();
 			if (!controlMap) return;
 			controlMap->ToggleControls(flag, enable, false);

@@ -3,6 +3,7 @@
 #include <commctrl.h>
 
 #include "Communication.h"
+#include "TaskDispatcher.h"
 #include "Core.h"
 #include "GamepadInputHandler.h"
 #include "ImeHelper.h"
@@ -539,7 +540,7 @@ namespace PrismaUI::InputHandler {
 
                                             if (!selectedText.empty()) {
                                                 // Copy to clipboard on Skyrim main thread to avoid blocking
-                                                SKSE::GetTaskInterface()->AddTask([text = selectedText]() {
+                                                PrismaUI::Tasks::AddTask([text = selectedText]() {
                                                     SetClipboardText(text);
                                                     logger::debug("Ctrl+C: Copied {} characters to clipboard",
                                                                   text.length());

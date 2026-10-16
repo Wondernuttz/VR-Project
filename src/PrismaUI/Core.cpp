@@ -3,6 +3,7 @@
 #include <eh.h>  // For _set_se_translator
 
 #include "Communication.h"
+#include "TaskDispatcher.h"
 #include "InputHandler.h"
 #include "Inspector.h"
 #include "Listeners.h"
@@ -215,7 +216,7 @@ namespace PrismaUI::Core {
                     logger::info("WndProc hook installed successfully from render thread.");
                 } else {
                     logger::warn("Direct installation failed, scheduling on main thread...");
-                    SKSE::GetTaskInterface()->AddTask([]() {
+                    PrismaUI::Tasks::AddTask([]() {
                         logger::info("Attempting to install WndProc hook from main thread...");
                         if (InstallWndProcHook()) {
                             logger::info("WndProc hook installed successfully from main thread.");

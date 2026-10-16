@@ -1,0 +1,199 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>RUNNING</title>
+<style>
+  html, body { margin: 0; width: 100%; height: 100%; overflow: hidden; }
+  *::-webkit-scrollbar { width: 22px; height: 22px; }
+  #outer { position: absolute; left: 20px; top: 20px; width: 320px; height: 220px; overflow: auto; }
+  #outer-content { width: 520px; height: 520px; padding: 20px; }
+  #inner { width: 180px; height: 110px; overflow: auto; }
+  #inner-content { width: 360px; height: 380px; }
+  #inner-button, #inner-range { display: block; margin-top: 6px; }
+  #scaled { position: absolute; left: 420px; top: 20px; width: 180px; height: 120px;
+            overflow: auto; transform: scale(1.35); transform-origin: top left; }
+  #scaled-content { width: 350px; height: 330px; }
+  #rtl { position: absolute; left: 760px; top: 20px; width: 180px; height: 120px;
+         overflow: auto; direction: rtl; }
+  #rtl-content { width: 350px; height: 330px; }
+  #controls { position: absolute; left: 20px; top: 290px; display: flex; gap: 12px; }
+  #pointer { cursor: pointer; padding: 8px; }
+  #plain { position: absolute; left: 420px; top: 260px; width: 180px; height: 80px; }
+</style>
+<div id="outer">
+  <div id="outer-content">
+    <div id="inner"><div id="inner-content"><span id="hit">inner content</span><button id="inner-button">highlighted row</button><input id="inner-range" type="range"></div></div>
+  </div>
+</div>
+<div id="scaled"><div id="scaled-content">scaled content</div></div>
+<div id="rtl"><div id="rtl-content">RTL content</div></div>
+<div id="controls">
+  <button id="button">button</button>
+  <input id="range" type="range">
+  <div id="slider" role="slider" tabindex="0">slider</div>
+  <div id="pointer">pointer row</div>
+</div>
+<div id="plain">ordinary panel surface</div>
+<pre id="result"></pre>
+<script>
+// Keep this classifier byte-for-byte equivalent in behavior to the JavaScript
+// assembled by CaptureScrollTargetAsync in PrismaVR.cpp.
+function capture(hand, x, y) {
+  var k = '__prismaVrScrollTargets';
+  if (!window[k]) window[k] = [null, null];
+  window[k][hand] = null;
+
+  function directDrag(n, s) {
+    var t = n.tagName || '';
+    var role = ((n.getAttribute && n.getAttribute('role')) || '').toLowerCase();
+    if ((t === 'INPUT' && ((n.getAttribute('type') || '').toLowerCase() === 'range')) ||
+        role === 'slider' || role === 'scrollbar') return true;
+    if (n.getAttribute && n.getAttribute('draggable') === 'true') return true;
+    return s.cursor === 'grab' || s.cursor === 'grabbing' || s.cursor === 'move' ||
+           s.cursor === 'col-resize' || s.cursor === 'row-resize' ||
+           s.cursor === 'ew-resize' || s.cursor === 'ns-resize';
+  }
+
+  function control(n, s) {
+    var t = n.tagName || '';
+    if (/^(BUTTON|INPUT|SELECT|TEXTAREA|OPTION|LABEL|SUMMARY|AUDIO|VIDEO|IFRAME)$/.test(t) ||
+        (t === 'A' && n.getAttribute('href') !== null) || n.isContentEditable) return true;
+    var role = ((n.getAttribute && n.getAttribute('role')) || '').toLowerCase();
+    if (/^(button|slider|scrollbar|textbox|searchbox|combobox|checkbox|radio|link|spinbutton|switch|tab|option|listbox|treeitem|gridcell|menuitem|menuitemcheckbox|menuitemradio)$/.test(role)) return true;
+    if ((n.hasAttribute && n.hasAttribute('onclick')) || typeof n.onclick === 'function') return true;
+    return directDrag(n, s) || s.cursor === 'pointer';
+  }
+
+  function gutter(n, s, sx, sy) {
+    if (!n.getBoundingClientRect || !n.offsetWidth || !n.offsetHeight) return false;
+    var r = n.getBoundingClientRect(), kx = r.width / n.offsetWidth, ky = r.height / n.offsetHeight;
+    if (!isFinite(kx) || !isFinite(ky) || kx <= 0 || ky <= 0) return false;
+    var lx = (x - r.left) / kx, ly = (y - r.top) / ky;
+    var cl = n.clientLeft, ct = n.clientTop, cr = cl + n.clientWidth, cb = ct + n.clientHeight;
+    return (sy && ly >= ct && ly < cb && (lx < cl || lx >= cr)) ||
+           (sx && lx >= cl && lx < cr && (ly < ct || ly >= cb)) ||
+           (sx && sy && (lx < cl || lx >= cr) && (ly < ct || ly >= cb));
+  }
+
+  var e = document.elementFromPoint(x, y);
+  if (!e) return '1';
+  var n = e, interactive = false, drag = false;
+  while (n) {
+    var s = window.getComputedStyle(n);
+    interactive = interactive || control(n, s);
+    drag = drag || directDrag(n, s);
+    var oy = s.overflowY, ox = s.overflowX;
+    var sy = (oy === 'scroll' || oy === 'auto' || oy === 'overlay') && n.scrollHeight > n.clientHeight + 1;
+    var sx = (ox === 'scroll' || ox === 'auto' || ox === 'overlay') && n.scrollWidth > n.clientWidth + 1;
+    if (sx || sy) {
+      if (gutter(n, s, sx, sy) || drag) return '1';
+      window[k][hand] = n;
+      return '2';
+    }
+    if (n === document.body || n === document.documentElement) break;
+    n = n.parentElement;
+  }
+  var r = document.scrollingElement || document.documentElement;
+  if (r && (r.scrollHeight > r.clientHeight + 1 || r.scrollWidth > r.clientWidth + 1)) {
+    var rs = window.getComputedStyle(r), rx = r.scrollWidth > r.clientWidth + 1, ry = r.scrollHeight > r.clientHeight + 1;
+    if (gutter(r, rs, rx, ry) || drag) return '1';
+    window[k][hand] = r;
+    return '2';
+  }
+  return interactive ? '1' : '0';
+}
+
+function scrollCaptured(hand, dx, dy) {
+  var a = window.__prismaVrScrollTargets, t = a && a[hand];
+  if (!t || !(t === document.scrollingElement || document.documentElement.contains(t))) {
+    if (a) a[hand] = null;
+    return;
+  }
+  if (dx) t.scrollLeft += dx;
+  if (dy) t.scrollTop += dy;
+}
+
+function clearCaptured(hand) {
+  var a = window.__prismaVrScrollTargets;
+  if (a) a[hand] = null;
+}
+
+function center(element) {
+  var r = element.getBoundingClientRect();
+  return { x: r.left + r.width / 2, y: r.top + r.height / 2 };
+}
+
+function check(condition, message, failures) {
+  if (!condition) failures.push(message);
+}
+
+window.addEventListener('load', function () {
+  var failures = [];
+  var outer = document.getElementById('outer');
+  var inner = document.getElementById('inner');
+  var hit = document.getElementById('hit').getBoundingClientRect();
+
+  check(capture(0, hit.left + 2, hit.top + 2) === '2', 'inner content is grabbable', failures);
+  check(window.__prismaVrScrollTargets[0] === inner, 'nearest nested pane captured', failures);
+  scrollCaptured(0, 0, 50);
+  check(inner.scrollTop === 50, 'inner pane moved', failures);
+  check(outer.scrollTop === 0, 'outer pane stayed isolated', failures);
+
+  clearCaptured(0);
+  scrollCaptured(0, 0, 50);
+  check(inner.scrollTop === 50 && outer.scrollTop === 0, 'release clears exact target', failures);
+
+  inner.scrollTop = 0;
+  var innerButton = center(document.getElementById('inner-button'));
+  check(capture(0, innerButton.x, innerButton.y) === '2', 'highlighted selection remains scroll-capturable', failures);
+  check(window.__prismaVrScrollTargets[0] === inner, 'selection captures its nearest pane', failures);
+  var innerRange = center(document.getElementById('inner-range'));
+  check(capture(0, innerRange.x, innerRange.y) === '1', 'range keeps native direct drag inside a pane', failures);
+  check(window.__prismaVrScrollTargets[0] === null, 'direct drag captures no scroll pane', failures);
+
+  inner.scrollTop = 0;
+  var outerRect = outer.getBoundingClientRect();
+  check(capture(1, outerRect.left + 270, outerRect.top + 150) === '2', 'outer content is grabbable', failures);
+  check(window.__prismaVrScrollTargets[1] === outer, 'outer pane captured from its own content', failures);
+  scrollCaptured(1, 0, 40);
+  check(outer.scrollTop === 40 && inner.scrollTop === 0, 'only explicitly captured outer pane moves', failures);
+
+  outer.scrollTop = 0;
+  outer.scrollLeft = 0;
+  outerRect = outer.getBoundingClientRect();
+  check(capture(0, outerRect.right - 5, outerRect.top + 70) === '1', 'vertical scrollbar blocks panel grab', failures);
+  check(window.__prismaVrScrollTargets[0] === null, 'vertical scrollbar captures no pane', failures);
+  check(capture(0, outerRect.left + 80, outerRect.bottom - 5) === '1', 'horizontal scrollbar blocks panel grab', failures);
+
+  var scaled = document.getElementById('scaled');
+  var scaledRect = scaled.getBoundingClientRect();
+  check(capture(0, scaledRect.right - 6, scaledRect.top + 50) === '1', 'scaled scrollbar blocks panel grab', failures);
+  check(capture(0, scaledRect.left + 40, scaledRect.top + 40) === '2', 'scaled pane content remains grabbable', failures);
+  check(window.__prismaVrScrollTargets[0] === scaled, 'scaled pane is captured exactly', failures);
+
+  var rtl = document.getElementById('rtl');
+  var rtlRect = rtl.getBoundingClientRect();
+  check(capture(0, rtlRect.left + 5, rtlRect.top + 50) === '1', 'RTL left scrollbar blocks panel grab', failures);
+  check(capture(0, rtlRect.left + 55, rtlRect.top + 50) === '2', 'RTL pane content remains grabbable', failures);
+  check(window.__prismaVrScrollTargets[0] === rtl, 'RTL pane is captured exactly', failures);
+
+  ['button', 'range', 'slider', 'pointer'].forEach(function (id) {
+    var p = center(document.getElementById(id));
+    check(capture(1, p.x, p.y) === '1', id + ' blocks panel grab', failures);
+    check(window.__prismaVrScrollTargets[1] === null, id + ' captures no scroll pane', failures);
+  });
+
+  var plain = center(document.getElementById('plain'));
+  check(capture(1, plain.x, plain.y) === '0', 'ordinary panel surface remains grabbable', failures);
+  check(capture(1, -100, -100) === '1', 'null DOM hit fails closed', failures);
+
+  var doomed = document.getElementById('scaled');
+  var doomedPoint = { x: scaledRect.left + 40, y: scaledRect.top + 40 };
+  check(capture(0, doomedPoint.x, doomedPoint.y) === '2', 'removal test captures pane', failures);
+  doomed.remove();
+  scrollCaptured(0, 0, 30);
+  check(window.__prismaVrScrollTargets[0] === null, 'removed target clears instead of bubbling', failures);
+
+  document.getElementById('result').textContent = failures.length ? failures.join('\n') : 'PASS';
+  document.title = failures.length ? 'FAIL ' + failures.join(' | ') : 'PASS';
+});
+</script>
