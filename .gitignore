@@ -5,6 +5,8 @@
 .vscode/
 !.vscode/c_cpp_properties.json
 .xmake/
+/.agents/AGENTS.md
+/.claude/CLAUDE.md
 
 # folders
 build/
