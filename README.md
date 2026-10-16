@@ -5,6 +5,19 @@ Skyrim Next-Gen Web UI Framework.
 - **Docs and Guides: https://www.prismaui.dev**
 - **Discord Community: https://discord.com/invite/QYztzZY8RG**
 
+## VR Alpha 8.2
+
+The VR build routes SKSE task submission through a dedicated worker so rendering
+and browser callbacks cannot block on the native task queue. Tasks still execute
+through their original game or UI scheduler, preserving submission order.
+
+This version includes adaptive laser smoothing, anchored panel grabs, and
+same-hand scrolling after a half-second trigger hold. Configure the input behavior
+in `SKSE/plugins/PrismaUI_VR.ini`.
+
+External surface hosting through API v3 is retained, including synchronized
+texture snapshots, deferred initialization, and overlay texture lifetime fixes.
+
 ## Contributing Guide
 
 - Use `dev` branch for your pull requests.
